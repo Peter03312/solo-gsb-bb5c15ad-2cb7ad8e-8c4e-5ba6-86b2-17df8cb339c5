@@ -4,8 +4,15 @@ from __future__ import annotations
 from fastapi import APIRouter, Query
 
 from .. import db
+from ..errors import not_found
 from ..models import CalibrationCorrect, CalibrationCreate, serialize_calibration
-from ..repository import compute_drift, correct_calibration, create_calibration
+from ..repository import (
+    compute_drift,
+    correct_calibration,
+    create_calibration,
+    instrument_of_calibration,
+    prelock_instrument,
+)
 from ..transactions import run_tx
 
 router = APIRouter(prefix="/calibrations", tags=["calibrations"])
@@ -17,7 +24,10 @@ def create(payload: CalibrationCreate):
 
     区间冲突（同仪器当前版本 [valid_from, valid_to) 重叠）返回 409。
     """
-    row = run_tx(lambda conn: create_calibration(conn, payload))
+    row = run_tx(
+        lambda conn: create_calibration(conn, payload),
+        prelock=prelock_instrument(payload.instrument),
+    )
     return {"calibration": serialize_calibration(row)}
 
 
@@ -29,7 +39,16 @@ def correct(payload: CalibrationCorrect):
     - 新版本区间与该仪器其他当前版本重叠 -> 409 INTERVAL_OVERLAP
     - 成功后顺带返回“结论与发布快照不同”的已发布报告列表（不修改快照）
     """
-    new_row, drift = run_tx(lambda conn: correct_calibration(conn, payload))
+    # 仪器来自被引用记录：先在事务外解析并预取仪器锁
+    assert db.pool is not None
+    with db.pool.connection() as probe:
+        instrument = instrument_of_calibration(probe, payload.corrects_id)
+    if instrument is None:
+        raise not_found("校准记录", payload.corrects_id)
+    new_row, drift = run_tx(
+        lambda conn: correct_calibration(conn, payload),
+        prelock=prelock_instrument(instrument),
+    )
     return {"calibration": serialize_calibration(new_row),
             "affected_report_drift": drift}
 

@@ -7,8 +7,8 @@ from .. import db
 from ..errors import not_found
 from ..models import ReportSubmit
 from ..repository import compute_drift
+from ..repository import prelock_instrument, publish_report
 from ..transactions import run_tx
-from ..repository import publish_report
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 
@@ -34,9 +34,13 @@ def submit_report(payload: ReportSubmit):
     （区间左闭右开，仅最新版参与判定）。
 
     - 放行：201，返回所据校准版本及不可变判定快照
+    - 命中未撤销禁用区间：422 INSTRUMENT_DISABLED（即使校准通过），detail 含禁用依据
     - 缺失校准 / 区间外 / 校准未通过：422，detail 内含阻断原因码与说明
     """
-    return run_tx(lambda conn: publish_report(conn, payload))
+    return run_tx(
+        lambda conn: publish_report(conn, payload),
+        prelock=prelock_instrument(payload.instrument),
+    )
 
 
 # 注意：静态路由需在 /{report_id} 之前声明
