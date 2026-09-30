@@ -78,6 +78,42 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_report_reference
     ON reports (reference) WHERE reference IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_report_instrument_tested
     ON reports (instrument, tested_at);
+
+-- 仪器禁用区间：校准合格后仍可能因故障被禁用；按唯一事件号登记/撤销，记录保留供追溯
+CREATE TABLE IF NOT EXISTS instrument_disables (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    event_no      TEXT        NOT NULL,               -- 唯一事件号（业务侧提供）
+    instrument    TEXT        NOT NULL,
+    disabled_from TIMESTAMPTZ NOT NULL,
+    disabled_to   TIMESTAMPTZ,                        -- NULL = 开放区间（持续禁用）
+    reason        TEXT        NOT NULL,               -- 禁用原因
+    revoked_at    TIMESTAMPTZ,                        -- NULL = 未撤销（生效中）；撤销仅标记，不删行
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_disable_interval CHECK (disabled_to IS NULL OR disabled_to > disabled_from)
+);
+
+-- 事件号全局唯一（撤销后仍占用，保证可追溯、不可复用）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_disable_event_no
+    ON instrument_disables (event_no);
+
+-- 同仪器“未撤销”的禁用区间 [disabled_from, disabled_to) 不得重叠；边界相接允许。
+-- 撤销（revoked_at 置位）后自动退出约束，原区间可重新登记。
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'excl_active_disable_interval'
+    ) THEN
+        ALTER TABLE instrument_disables
+            ADD CONSTRAINT excl_active_disable_interval
+            EXCLUDE USING gist (
+                instrument WITH =,
+                tstzrange(disabled_from, disabled_to, '[)') WITH &&
+            ) WHERE (revoked_at IS NULL);
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS ix_disable_instrument_active
+    ON instrument_disables (instrument) WHERE revoked_at IS NULL;
 """
 
 

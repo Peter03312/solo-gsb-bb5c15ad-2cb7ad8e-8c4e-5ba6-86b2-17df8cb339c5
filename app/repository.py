@@ -18,6 +18,8 @@ REASON_NO_CALIBRATION = "NO_CALIBRATION"
 REASON_OUTSIDE_PERIOD = "OUTSIDE_VALID_PERIOD"
 # 覆盖检测时间的当前校准版本结论为未通过
 REASON_NOT_PASSED = "CALIBRATION_NOT_PASSED"
+# 检测时间命中该仪器未撤销的禁用区间（即使校准通过也不放行）
+REASON_INSTRUMENT_DISABLED = "INSTRUMENT_DISABLED"
 
 _COVERAGE_SQL = """
     SELECT *
@@ -37,6 +39,16 @@ _NEAREST_SQL = """
              valid_from ASC
 """
 
+# 命中检测时点的未撤销禁用区间（左闭右开）
+_DISABLE_HIT_SQL = """
+    SELECT *
+    FROM instrument_disables
+    WHERE instrument = %s
+      AND revoked_at IS NULL
+      AND disabled_from <= %s
+      AND (disabled_to IS NULL OR %s < disabled_to)
+"""
+
 
 def _cal_brief(row: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -47,6 +59,39 @@ def _cal_brief(row: dict[str, Any]) -> dict[str, Any]:
         "valid_to": row["valid_to"].isoformat() if row["valid_to"] else None,
         "passed": row["passed"],
     }
+
+
+def _disable_brief(row: dict[str, Any]) -> dict[str, Any]:
+    """禁用依据（随阻断响应/受影响报告查询返回）。"""
+    return {
+        "event_no": row["event_no"],
+        "instrument": row["instrument"],
+        "disabled_from": row["disabled_from"].isoformat(),
+        "disabled_to": row["disabled_to"].isoformat() if row["disabled_to"] else None,
+        "reason": row["reason"],
+    }
+
+
+def find_active_disable(conn, instrument: str, tested_at: datetime,
+                        *, lock: bool) -> dict[str, Any] | None:
+    """返回命中该时点的未撤销禁用区间；无命中返回 None。
+
+    ``lock=True`` 时对命中行加 FOR UPDATE，并在无命中时锁定该仪器全部未撤销
+    区间 —— 与并发撤销互斥；并发“登记新区间”由 SERIALIZABLE 谓词锁覆盖，
+    保证“发布”与“禁用变更”可串行化。
+    """
+    sql = _DISABLE_HIT_SQL + (" FOR UPDATE" if lock else "")
+    with conn.cursor() as cur:
+        cur.execute(sql, (instrument, tested_at, tested_at))
+        hit = cur.fetchone()
+        if hit is None and lock:
+            cur.execute(
+                "SELECT id FROM instrument_disables "
+                "WHERE instrument = %s AND revoked_at IS NULL FOR UPDATE",
+                (instrument,),
+            )
+            cur.fetchall()
+    return hit
 
 
 def determine(conn, instrument: str, tested_at: datetime, *, lock: bool) -> dict[str, Any]:
@@ -211,9 +256,124 @@ def correct_calibration(conn, payload) -> tuple[dict[str, Any], list[dict[str, A
     return new_row, drift
 
 
+# ---- 禁用区间登记/撤销 ------------------------------------------------------------
+
+def create_disable(conn, payload) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """登记禁用区间。返回 (禁用记录, 命中该区间的已发布报告列表)。"""
+    if payload.disabled_to is not None and payload.disabled_to <= payload.disabled_from:
+        raise blocked("INVALID_INTERVAL",
+                      "禁用区间必须满足 disabled_from < disabled_to（左闭右开）")
+    with conn.cursor() as cur:
+        try:
+            cur.execute(
+                """
+                INSERT INTO instrument_disables
+                    (event_no, instrument, disabled_from, disabled_to, reason)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (payload.event_no, payload.instrument, payload.disabled_from,
+                 payload.disabled_to, payload.reason),
+            )
+        except UniqueViolation:
+            raise conflict("DISABLE_EVENT_EXISTS",
+                           f"禁用事件号已存在: {payload.event_no}",
+                           event_no=payload.event_no)
+        except ExclusionViolation:
+            raise conflict("DISABLE_INTERVAL_OVERLAP",
+                           "与该仪器另一条未撤销禁用区间重叠（边界相接允许）",
+                           instrument=payload.instrument)
+        row = cur.fetchone()
+
+    affected = _disable_affected(conn, instrument=payload.instrument)
+    return row, affected
+
+
+def revoke_disable(conn, event_no: str) -> dict[str, Any]:
+    """按事件号撤销禁用：仅标记 revoked_at，记录保留供追溯。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM instrument_disables WHERE event_no = %s FOR UPDATE",
+            (event_no,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise not_found("禁用事件", event_no)
+        if row["revoked_at"] is not None:
+            raise conflict("DISABLE_ALREADY_REVOKED",
+                           f"禁用事件已撤销: {event_no}",
+                           event_no=event_no,
+                           revoked_at=row["revoked_at"].isoformat())
+        cur.execute(
+            "UPDATE instrument_disables SET revoked_at = now() "
+            "WHERE id = %s RETURNING *",
+            (row["id"],),
+        )
+        return cur.fetchone()
+
+
+def compute_disable_affected(conn, instrument: str | None = None) -> list[dict[str, Any]]:
+    return _disable_affected(conn, instrument=instrument)
+
+
+def _disable_affected(conn, instrument: str | None) -> list[dict[str, Any]]:
+    """按当前（未撤销）禁用状态，列出检测时间命中禁用区间的已发布报告及禁用依据。
+
+    只读重算：登记/撤销后结果随之变化；报告原放行记录与快照绝不改写。
+    同仪器未撤销区间不重叠，故每份报告至多命中一条禁用依据。
+    """
+    sql = """
+        SELECT r.id AS report_id, r.reference, r.instrument, r.tested_at, r.snapshot,
+               d.event_no, d.disabled_from, d.disabled_to, d.reason
+        FROM reports r
+        JOIN instrument_disables d
+          ON d.instrument = r.instrument
+         AND d.revoked_at IS NULL
+         AND d.disabled_from <= r.tested_at
+         AND (d.disabled_to IS NULL OR r.tested_at < d.disabled_to)
+        WHERE r.released = TRUE
+    """
+    params: list[Any] = []
+    if instrument:
+        sql += " AND r.instrument = %s"
+        params.append(instrument)
+    sql += " ORDER BY r.id"
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+    return [
+        {
+            "report_id": row["report_id"],
+            "reference": row["reference"],
+            "instrument": row["instrument"],
+            "tested_at": row["tested_at"].isoformat(),
+            "snapshot": row["snapshot"],
+            "disable": {
+                "event_no": row["event_no"],
+                "disabled_from": row["disabled_from"].isoformat(),
+                "disabled_to": row["disabled_to"].isoformat() if row["disabled_to"] else None,
+                "reason": row["reason"],
+            },
+        }
+        for row in rows
+    ]
+
+
 # ---- 报告发布 ------------------------------------------------------------------
 
 def publish_report(conn, payload) -> dict[str, Any]:
+    # 先查禁用：检测时间命中未撤销禁用区间即拒绝放行，即使当前校准通过
+    disable = find_active_disable(conn, payload.instrument, payload.tested_at, lock=True)
+    if disable is not None:
+        raise blocked(
+            REASON_INSTRUMENT_DISABLED,
+            f"检测时间 {payload.tested_at.isoformat()} 命中仪器 {payload.instrument} "
+            f"的未撤销禁用区间（事件号 {disable['event_no']}）：{disable['reason']}",
+            instrument=payload.instrument,
+            tested_at=payload.tested_at.isoformat(),
+            disable=_disable_brief(disable),
+        )
+
     decision = determine(conn, payload.instrument, payload.tested_at, lock=True)
     basis = decision["calibration"]
     snapshot: dict[str, Any] = {
